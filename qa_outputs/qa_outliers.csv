@@ -1,0 +1,7 @@
+file,mode_folder,type,row_index,t_ms,value
+bus_seg1_20260204_170911.csv,bus,pressure,0,33719,812.68
+car_seg1_20260203_192212.csv,car,pressure,0,50234,812.68
+car_seg3_20260224_143641.csv,car,pressure,0,741150,812.68
+train_seg1_20260126_102443.csv,train,pressure,0,93792,812.68
+walk_seg2_20260204_102215.csv,walk,pressure,0,1979302,812.68
+walk_seg3_20260204_113119.csv,walk,pressure,0,28366,812.68
