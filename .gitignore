@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Large data files — stored locally only
+data/raw/shl/
+data/processed/*.npz
+data/processed/*.keras
+data/processed/windowed/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
