@@ -17,7 +17,7 @@ import pandas as pd
 from collections import defaultdict
 
 # ---------------- CONFIG ----------------
-IN_PATH = "/Users/spenceraldrich/Desktop/Union/Senior/Winter 2026/ECE-499/data/processed/windowed/windows_8s_50pct.npz"
+IN_PATH = "/Users/spenceraldrich/Desktop/Union/Senior/Winter 2026/ECE-499/data/processed/windows_8s_50pct.npz"
 OUT_DIR = "/Users/spenceraldrich/Desktop/Union/Senior/Winter 2026/ECE-499/data/processed"
 OUT_NAME = "baseline_features_v4_segment_split_train_val_test.npz"
 

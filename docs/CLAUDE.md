@@ -51,10 +51,15 @@ Verify this ordering against your .keras file before flashing:
 
 ---
 
-## Normalization — CRITICAL, DO NOT RECOMPUTE AT RUNTIME
-Z-score computed from TRAIN split only:
-  mu    = X_train.mean(axis=(0,1), keepdims=True)  # shape (1,1,7,1)
-  sigma = X_train.std(axis=(0,1),  keepdims=True) + 1e-8
+## Normalization — CONFIRMED
+mu and sigma are stored directly in the .npz file under keys 'mu' and 'sigma'.
+DO NOT recompute — read from file:
+  data = np.load("baseline_features_v3_segment_split_train_val_test.npz")
+  mu    = data["mu"]     # shape (7,) — per channel
+  sigma = data["sigma"]  # shape (7,) — per channel
+
+Channel order confirmed: ['ax', 'ay', 'az', 'gx', 'gy', 'gz', 'pressure']
+Mode order confirmed: ['train', 'subway', 'car', 'bus', 'walk'] → IDs 0-4
 
 Accelerometer biases (subtract before normalization):
   ACC_BIAS_X = -0.1926, ACC_BIAS_Y = -0.1975, ACC_BIAS_Z = -0.3472 (m/s²)
