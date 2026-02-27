@@ -139,7 +139,6 @@ git add -A && git commit -m "[#N] description" && git push
 
 ## DO NOT
 
-- Do not improve the model — accuracy is sufficient
 - Do not add features beyond the 16 issues in BUILD_PHASES.md
 - Do not transmit raw sensor data over BLE under any circumstances
 - Do not use heap allocation in firmware (static arena only for TFLite)
