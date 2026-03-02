@@ -27,14 +27,22 @@ Sampling: 25 Hz | Window: 5s (125 samples) | Overlap: 50%
 
 ---
 
-## ML Model — CONFIRMED ARCHITECTURE
-- Input shape: (125, 7, 1) — 125 timesteps × 7 channels × 1 channel dim
-- Channels (in order): ax, ay, az, gx, gy, gz, pressure_hpa
-- Architecture: Conv2D(16, 9×1) → MaxPool → Conv2D(32, 9×1) → MaxPool → Flatten → Dense(64) → Dropout(0.3) → Dense(5, softmax)
-- NOTE: Confirm kernel size (9×1 vs 5×1) by running model.summary() on pretrained_shl_coarse.keras before TFLite conversion
-- Training: SHL pretraining (5×1 kernels) → transfer weights → linear probe → full fine-tune on self-data
-- Test accuracy: ~95–96% (leakage-free, segment-split v3 dataset)
-- Model file: data/processed/pretrained_shl_coarse.keras (locally on Mac, NOT in git)
+## ML Model — FINAL CONFIRMED ARCHITECTURE
+- Window: 8s at 25Hz = 200 samples (WIN_N=200, STEP_N=100)
+- Input shape: (200, 7, 1)
+- Channels: ax_corr, ay_corr, az_corr, gx, gy, gz, pressure_hpa
+- Architecture: Conv2D(16,9×1) → MaxPool(2×1) → Conv2D(32,9×1) → 
+                MaxPool(2×1) → Flatten → Dense(64) → Dropout(0.3) → Dense(5, softmax)
+- Modes: ['train','subway','car','bus','walk'] → IDs 0–4
+- Dataset: baseline_features_v4_segment_split_train_val_test.npz
+- Train: 360 windows (72/class), Val: 1019, Test: 440 (88/class)
+
+## Normalization — FINAL CONFIRMED (v4, 200-sample windows)
+mu:    [-7.79250193, 2.07272148, 4.27278090, 
+         0.41056770, -0.15372396, 0.16609201, 1014.45190430]
+sigma: [1.59938383, 1.88753140, 3.04334497,
+        18.63519859, 9.55679989, 8.78757954, 8.03807831]
+norm_stats.h: ✅ generated and correct
 
 ## Mode ID Encoding — MUST MATCH BETWEEN FIRMWARE AND MODEL
 Verify this ordering against your .keras file before flashing:
