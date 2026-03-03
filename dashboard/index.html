@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CO₂ Beacon Dashboard</title>
+  <!--
+    Single-file React 18 dashboard via CDN.
+    No build step — open directly in Chrome (Web Bluetooth requires Chrome).
+    No localStorage. All state lives in React memory only.
+    Issue #12 — Edge CO₂ Beacon capstone (ECE499)
+  -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: #0f0f0f; color: #e8e8e8;
+           font-family: system-ui, -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #1a1a1a; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ── BLE UUIDs ──────────────────────────────────────────────────────────────
+    const SVC_UUID  = '4fafc201-1fb5-459e-8fcc-c5c9c3319100';
+    const LIVE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c3319101';
+    const TRIP_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c3319102';
+
+    // ── Mode metadata — order matches firmware MODE_NAMES[5] ──────────────────
+    const MODES = [
+      { name: 'Train',  icon: '🚆', color: '#4a9eff' },
+      { name: 'Subway', icon: '🚇', color: '#4a9eff' },
+      { name: 'Car',    icon: '🚗', color: '#ff5252' },
+      { name: 'Bus',    icon: '🚌', color: '#ff5252' },
+      { name: 'Walk',   icon: '🚶', color: '#4caf50' },
+    ];
+    const modeOf = (id) => MODES[id] ?? { name: 'Unknown', icon: '?', color: '#888' };
+
+    // ── Payload parsers — exact byte layout from docs/CLAUDE.md ───────────────
+    // LiveStatus (7 bytes):
+    //   [0] mode_id  [1] confidence  [2-5] timestamp_s LE  [6] trip_active
+    function parseLiveStatus(dv) {
+      return {
+        mode_id:     dv.getUint8(0),
+        confidence:  dv.getUint8(1),
+        timestamp_s: dv.getUint32(2, /*littleEndian=*/true),
+        trip_active: dv.getUint8(6) === 1,
+      };
+    }
+
+    // TripRecord (20 bytes):
+    //   [0-1] trip_id  [2] mode_id  [3] confidence
+    //   [4-7] ts_start  [8-11] ts_end
+    //   [12-13] duration_s  [14-15] distance_m  [16-17] co2_g  [18-19] reserved
+    function parseTripRecord(dv) {
+      return {
+        trip_id:    dv.getUint16(0,  true),
+        mode_id:    dv.getUint8(2),
+        confidence: dv.getUint8(3),
+        ts_start:   dv.getUint32(4,  true),
+        ts_end:     dv.getUint32(8,  true),
+        duration_s: dv.getUint16(12, true),
+        distance_m: dv.getUint16(14, true),
+        co2_g:      dv.getUint16(16, true),
+      };
+    }
+
+    // ── Formatting helpers ────────────────────────────────────────────────────
+    function fmtDuration(s) {
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const r = s % 60;
+      if (h > 0)  return `${h}h ${m}m`;
+      if (m > 0)  return `${m}m ${r}s`;
+      return `${r}s`;
+    }
+
+    function fmtDist(m) {
+      if (m >= 1000) return `${(m / 1000).toFixed(1)} km`;
+      return `${m} m`;
+    }
+
+    function fmtCO2(g) {
+      if (g >= 1000) return `${(g / 1000).toFixed(2)} kg`;
+      return `${g} g`;
+    }
+
+    // ── Shared style tokens ───────────────────────────────────────────────────
+    const S = {
+      card: {
+        background: '#1a1a1a',
+        border: '1px solid #2b2b2b',
+        borderRadius: 10,
+        padding: '1rem',
+      },
+      sectionLabel: {
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: 2,
+        color: '#555',
+        textTransform: 'uppercase',
+        marginBottom: 12,
+      },
+      row: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: '6px 0',
+        borderBottom: '1px solid #222',
+      },
+      dim: { color: '#666', fontSize: 13 },
+    };
+
+    // ── <StatusDot /> ─────────────────────────────────────────────────────────
+    function StatusDot({ on }) {
+      return (
+        <span style={{
+          display: 'inline-block',
+          width: 9, height: 9,
+          borderRadius: '50%',
+          background: on ? '#4caf50' : '#444',
+          boxShadow: on ? '0 0 7px #4caf50aa' : 'none',
+          flexShrink: 0,
+        }} />
+      );
+    }
+
+    // ── <ConnectButton /> ────────────────────────────────────────────────────
+    function ConnectButton({ connected, connecting, onConnect, onDisconnect }) {
+      const label = connecting ? 'Connecting…'
+                  : connected  ? 'Disconnect'
+                               : 'Connect to CO2-Beacon';
+      return (
+        <button
+          onClick={connected ? onDisconnect : onConnect}
+          disabled={connecting}
+          style={{
+            background:  connected  ? '#2d2d2d' : '#1e4dff',
+            color:       '#fff',
+            border:      connected  ? '1px solid #444' : 'none',
+            borderRadius: 7,
+            padding:     '0.45rem 1rem',
+            fontWeight:  600,
+            fontSize:    13,
+            cursor:      connecting ? 'wait' : 'pointer',
+            letterSpacing: 0.2,
+            transition:  'background 0.15s',
+          }}
+        >
+          {label}
+        </button>
+      );
+    }
+
+    // ── <LiveStatusPanel /> ──────────────────────────────────────────────────
+    function LiveStatusPanel({ status, connected }) {
+      if (!connected) {
+        return (
+          <div style={S.card}>
+            <div style={S.sectionLabel}>Live Status</div>
+            <div style={{ textAlign: 'center', color: '#444', padding: '2rem 0', fontSize: 13 }}>
+              Not connected
+            </div>
+          </div>
+        );
+      }
+
+      if (!status) {
+        return (
+          <div style={S.card}>
+            <div style={S.sectionLabel}>Live Status</div>
+            <div style={{ textAlign: 'center', color: '#555', padding: '2rem 0', fontSize: 13 }}>
+              Waiting for data…
+            </div>
+          </div>
+        );
+      }
+
+      const mode = modeOf(status.mode_id);
+
+      return (
+        <div style={S.card}>
+          <div style={S.sectionLabel}>Live Status</div>
+
+          {/* Big mode display */}
+          <div style={{ textAlign: 'center', padding: '0.5rem 0 1rem' }}>
+            <div style={{ fontSize: 56, lineHeight: 1.1 }}>{mode.icon}</div>
+            <div style={{
+              fontSize: 26, fontWeight: 700, color: mode.color, marginTop: 8,
+            }}>
+              {mode.name}
+            </div>
+          </div>
+
+          {/* Stats rows */}
+          <div style={S.row}>
+            <span style={S.dim}>Confidence</span>
+            <span style={{ fontWeight: 600, color: mode.color }}>{status.confidence}%</span>
+          </div>
+          <div style={{ ...S.row, borderBottom: 'none' }}>
+            <span style={S.dim}>Trip</span>
+            <span style={{
+              fontWeight: 600,
+              color: status.trip_active ? '#4caf50' : '#555',
+            }}>
+              {status.trip_active ? '● Active' : '○ Idle'}
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── <TripRow /> ──────────────────────────────────────────────────────────
+    function TripRow({ trip }) {
+      const mode = modeOf(trip.mode_id);
+      return (
+        <div style={{
+          padding: '0.7rem 1rem',
+          borderBottom: '1px solid #252525',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+            <span style={{ color: '#555', fontSize: 12 }}>#{trip.trip_id}</span>
+            <span style={{ fontWeight: 600, color: mode.color, fontSize: 14 }}>
+              {mode.icon} {mode.name}
+            </span>
+            <span style={{ color: '#777', fontSize: 12 }}>{fmtDuration(trip.duration_s)}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: '#666', fontSize: 12 }}>{fmtDist(trip.distance_m)}</span>
+            <span style={{ color: '#888', fontSize: 12 }}>
+              {trip.confidence}% conf
+            </span>
+            <span style={{ fontWeight: 700, fontSize: 13, color: mode.color }}>
+              CO₂ {fmtCO2(trip.co2_g)}
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── <TripHistoryPanel /> ─────────────────────────────────────────────────
+    function TripHistoryPanel({ trips }) {
+      const sessionCO2 = trips.reduce((sum, t) => sum + t.co2_g, 0);
+      // Newest first, show last 10
+      const visible = [...trips].sort((a, b) => b.trip_id - a.trip_id).slice(0, 10);
+
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {/* History list */}
+          <div style={S.card}>
+            <div style={S.sectionLabel}>Trip History</div>
+            {visible.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#444', padding: '2rem 0', fontSize: 13 }}>
+                No trips yet — trips appear here after TRIP_END events
+              </div>
+            ) : (
+              <div style={{ margin: '0 -1rem -1rem', borderTop: '1px solid #252525' }}>
+                {visible.map(t => <TripRow key={t.trip_id} trip={t} />)}
+              </div>
+            )}
+          </div>
+
+          {/* Session total */}
+          <div style={{ ...S.card, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <div style={S.sectionLabel}>Session Total CO₂</div>
+              <div style={{
+                fontSize: 28,
+                fontWeight: 700,
+                color: sessionCO2 === 0 ? '#4caf50' : sessionCO2 < 500 ? '#ff9800' : '#ff5252',
+              }}>
+                {fmtCO2(sessionCO2)}
+              </div>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <div style={S.sectionLabel}>Trips</div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: '#aaa' }}>
+                {trips.length}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── <App /> ───────────────────────────────────────────────────────────────
+    function App() {
+      const [connected,  setConnected]  = useState(false);
+      const [connecting, setConnecting] = useState(false);
+      const [status,     setStatus]     = useState(null);
+      const [trips,      setTrips]      = useState([]);
+      const [error,      setError]      = useState('');
+
+      const deviceRef = useRef(null);
+
+      // Stable callbacks so removeEventListener works correctly
+      const onLiveNotify = useCallback((e) => {
+        setStatus(parseLiveStatus(e.target.value));
+      }, []);
+
+      const onTripNotify = useCallback((e) => {
+        const trip = parseTripRecord(e.target.value);
+        setTrips(prev => {
+          // Deduplicate by trip_id (re-notify case)
+          const rest = prev.filter(t => t.trip_id !== trip.trip_id);
+          return [...rest, trip];
+        });
+      }, []);
+
+      const onGattDisconnect = useCallback(() => {
+        setConnected(false);
+        setStatus(null);
+      }, []);
+
+      const connect = async () => {
+        if (!navigator.bluetooth) {
+          setError('Web Bluetooth is not supported. Use Chrome on desktop or Android.');
+          return;
+        }
+        setError('');
+        setConnecting(true);
+
+        try {
+          const device = await navigator.bluetooth.requestDevice({
+            filters: [
+              { services: [SVC_UUID] },      // match by advertised service UUID
+              { name: 'CO2-Beacon' },         // or by device name
+            ],
+            optionalServices: [SVC_UUID],
+          });
+
+          deviceRef.current = device;
+          device.addEventListener('gattserverdisconnected', onGattDisconnect);
+
+          const server  = await device.gatt.connect();
+          const service = await server.getPrimaryService(SVC_UUID);
+
+          // Subscribe to LiveStatus (1 Hz notify)
+          const liveChr = await service.getCharacteristic(LIVE_UUID);
+          liveChr.addEventListener('characteristicvaluechanged', onLiveNotify);
+          await liveChr.startNotifications();
+
+          // Subscribe to TripRecord (notify on TRIP_END)
+          const tripChr = await service.getCharacteristic(TRIP_UUID);
+          tripChr.addEventListener('characteristicvaluechanged', onTripNotify);
+          await tripChr.startNotifications();
+
+          setConnected(true);
+        } catch (err) {
+          // NotFoundError = user dismissed the picker → not an error to surface
+          if (err.name !== 'NotFoundError') {
+            setError(`Connection failed: ${err.message}`);
+          }
+        } finally {
+          setConnecting(false);
+        }
+      };
+
+      const disconnect = () => {
+        if (deviceRef.current?.gatt?.connected) {
+          deviceRef.current.gatt.disconnect();
+        }
+        setConnected(false);
+        setStatus(null);
+        setError('');
+      };
+
+      return (
+        <div style={{ minHeight: '100vh', background: '#0f0f0f' }}>
+
+          {/* ── Header ── */}
+          <header style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            padding: '0.85rem 1.5rem',
+            background: '#141414',
+            borderBottom: '1px solid #222',
+            position: 'sticky',
+            top: 0,
+            zIndex: 10,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ fontSize: 20 }}>🌿</span>
+              <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 0.3 }}>
+                CO₂ Beacon
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <StatusDot on={connected} />
+              <span style={{ color: '#666', fontSize: 12, marginRight: 6 }}>
+                {connected ? 'Connected' : connecting ? 'Connecting…' : 'Disconnected'}
+              </span>
+              <ConnectButton
+                connected={connected}
+                connecting={connecting}
+                onConnect={connect}
+                onDisconnect={disconnect}
+              />
+            </div>
+          </header>
+
+          {/* ── Error banner ── */}
+          {error && (
+            <div style={{
+              background: '#3a1515',
+              color: '#ff8080',
+              padding: '0.6rem 1.5rem',
+              fontSize: 13,
+              borderBottom: '1px solid #5a2020',
+            }}>
+              ⚠ {error}
+            </div>
+          )}
+
+          {/* ── Chrome-only notice ── */}
+          {!navigator.bluetooth && !error && (
+            <div style={{
+              background: '#1e1a00',
+              color: '#c8a800',
+              padding: '0.6rem 1.5rem',
+              fontSize: 13,
+              borderBottom: '1px solid #3a3000',
+            }}>
+              ⚠ Web Bluetooth requires Chrome. Firefox and Safari are not supported.
+            </div>
+          )}
+
+          {/* ── Main body ── */}
+          <main style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(220px, 280px) 1fr',
+            gap: '1rem',
+            padding: '1rem 1.5rem',
+            maxWidth: 920,
+            margin: '0 auto',
+          }}>
+            {/* Left — live status */}
+            <div>
+              <LiveStatusPanel status={status} connected={connected} />
+            </div>
+
+            {/* Right — history + session total */}
+            <div>
+              <TripHistoryPanel trips={trips} />
+            </div>
+          </main>
+
+          {/* ── Footer ── */}
+          <footer style={{
+            textAlign: 'center',
+            color: '#333',
+            fontSize: 11,
+            padding: '2rem 1rem 1rem',
+            letterSpacing: 0.5,
+          }}>
+            ECE499 Edge CO₂ Beacon · No data leaves your browser · Raw sensor data never transmitted
+          </footer>
+
+        </div>
+      );
+    }
+
+    // ── Mount ─────────────────────────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
