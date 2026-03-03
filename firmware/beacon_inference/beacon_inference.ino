@@ -1,12 +1,16 @@
 // beacon_inference.ino
-// Issues #3 (25 Hz sampling), #4 (preprocessing), #5 (TFLite inference), #6 (latency)
+// Issues #3-#6 (sampling/preprocessing/inference/latency) ✅
+// Issue #8  (BLE GATT — LiveStatus + TripRecord)
+// Issues #10-#11 (distance + CO₂ estimation)
 //
 // Hardware confirmed from LOGGER_BUTTON_v1.3:
 //   BNO055 I2C 0x28 | BMP390 I2C 0x77 | 400 kHz bus
 //
 // Inference pipeline:
 //   Sample 25 Hz → ring buffer (200 × 7) → z-score normalize → INT8 quantize
-//   → TFLite Micro → argmax → Serial print (mode, confidence, latency)
+//   → TFLite Micro → argmax → distance/CO₂ accumulate → BLE notify + Serial print
+
+#include <bluefruit.h>   // Bluefruit52Lib — Adafruit nRF52 core BLE stack
 
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -83,6 +87,28 @@ static float trip_co2_g      = 0.0f;
 static int   prev_mode_id    = -1;   // -1 = no prior inference
 static int   walk_streak     = 0;    // consecutive high-conf walk inferences
 
+// ── BLE GATT service (Issue #8) ───────────────────────────────────────────────
+// Service UUID and characteristic UUIDs (128-bit, custom)
+#define CO2_SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c3319100"
+#define LIVE_CHR_UUID "4fafc201-1fb5-459e-8fcc-c5c9c3319101"
+#define TRIP_CHR_UUID "4fafc201-1fb5-459e-8fcc-c5c9c3319102"
+
+BLEService        co2_svc(CO2_SVC_UUID);
+BLECharacteristic live_status_chr(LIVE_CHR_UUID);  // Notify, 7 bytes
+BLECharacteristic trip_record_chr(TRIP_CHR_UUID);  // Read+Notify, 20 bytes
+
+// Trip metadata written into TripRecord on TRIP_END
+static uint16_t trip_id       = 0;      // increments each TRIP_END
+static uint32_t trip_ts_start = 0;      // seconds since boot, set at trip start
+static uint8_t  trip_mode_id  = 0;      // dominant mode (last non-walk seen)
+
+// Current inference result — shared between runInference() and loop()
+static uint8_t  cur_mode_id   = 0;
+static uint8_t  cur_confidence = 0;
+
+// 1 Hz LiveStatus timer (independent of 25 Hz inference tick)
+static uint32_t ble_last_notify_ms = 0;
+
 // ── Sliding window ring buffer ────────────────────────────────────────────────
 // ring[t][c]: t=0 is the oldest sample, t=WIN_N-1 is the newest.
 // New samples are appended at ring[WIN_N-1] after shifting left by one row.
@@ -106,6 +132,10 @@ static bool setupTFLite();
 static void pushSample(float ax, float ay, float az,
                        float gx, float gy, float gz, float pres);
 static void runInference();
+static void setupBLE();
+static void startAdv();
+static void sendLiveStatus();
+static void notifyTripRecord(uint32_t ts_end);
 
 // =============================================================================
 void setup() {
@@ -149,6 +179,11 @@ void setup() {
     Serial.print(interpreter->arena_used_bytes());
     Serial.println("B");
 
+    // ── BLE ───────────────────────────────────────────────────────────────
+    setupBLE();
+    startAdv();
+    Serial.println("#OK:BLE  advertising as CO2-Beacon");
+
     // ── Boot summary ──────────────────────────────────────────────────────
     Serial.print("#CONFIG  WIN=");   Serial.print(WIN_N);
     Serial.print(" STEP=");          Serial.print(STEP_N);
@@ -163,6 +198,13 @@ void setup() {
 
 // =============================================================================
 void loop() {
+    // ── 1 Hz BLE LiveStatus notification (independent of inference tick) ──
+    uint32_t now_ms = millis();
+    if (now_ms - ble_last_notify_ms >= 1000UL) {
+        ble_last_notify_ms = now_ms;
+        sendLiveStatus();
+    }
+
     // ── Exact 25 Hz tick via micros() — no delay() ───────────────────────
     uint32_t nowUs = micros();
     if ((int32_t)(nowUs - nextTickUs) < 0) return;
@@ -280,20 +322,32 @@ static void runInference() {
     uint32_t lat_ms    = latency_us / 1000;
     uint32_t lat_frac  = (latency_us % 1000) / 10;   // tenths of ms
 
-    // ── 4. Issue #10: distance accumulation ──────────────────────────────
-    // Each step covers INTERVAL_S seconds at the mode's average speed.
+    // ── 4. Update shared state for LiveStatus BLE notifications ──────────
+    cur_mode_id    = (uint8_t)best_id;
+    cur_confidence = confidence;
+
+    // ── 5. Issue #10: distance accumulation ──────────────────────────────
+    // Mark trip start on the first inference after a reset (trip_distance_m==0)
+    if (trip_distance_m == 0.0f) {
+        trip_ts_start = millis() / 1000;
+        trip_mode_id  = (uint8_t)best_id;   // record mode at trip start
+    }
+    // Track dominant motorised mode (last non-walk seen during trip)
+    if (best_id != 4) {
+        trip_mode_id = (uint8_t)best_id;
+    }
     const float delta_m = SPEED_MPS[best_id] * INTERVAL_S;
     trip_distance_m += delta_m;
 
-    // ── 5. Issue #11: CO₂ accumulation ───────────────────────────────────
+    // ── 6. Issue #11: CO₂ accumulation ───────────────────────────────────
     // co2_g += (delta_m / 1000) * factor_kg_per_km * 1000  = delta_m * factor
     trip_co2_g += delta_m * CO2_KG_PER_KM[best_id];
 
-    // ── 6. Trip boundary detection — reset accumulators on trip end ──────
+    // ── 7. Trip boundary detection — reset accumulators on trip end ──────
     // Condition A: motorised → walk (arrived at destination)
     bool trip_end = (prev_mode_id >= 0 && prev_mode_id != 4 && best_id == 4);
 
-    // Condition B: sustained walk ≥ 60 s at conf ≥ 80% (new walking segment)
+    // Condition B: sustained walk ≥ 60 s at conf ≥ 80% (walking segment boundary)
     if (best_id == 4 && confidence >= 80) {
         walk_streak++;
     } else {
@@ -305,11 +359,13 @@ static void runInference() {
     }
 
     if (trip_end && trip_distance_m > 0.0f) {
-        Serial.print("TRIP_END  DIST:");
-        Serial.print(trip_distance_m, 1);
-        Serial.print("m  CO2:");
-        Serial.print(trip_co2_g, 1);
+        uint32_t ts_end = millis() / 1000;
+        Serial.print("TRIP_END  ID:");   Serial.print(trip_id);
+        Serial.print("  DIST:");         Serial.print(trip_distance_m, 1);
+        Serial.print("m  CO2:");         Serial.print(trip_co2_g, 1);
         Serial.println("g");
+        notifyTripRecord(ts_end);        // Issue #8: BLE TripRecord notify
+        trip_id++;
         trip_distance_m = 0.0f;
         trip_co2_g      = 0.0f;
     }
@@ -382,4 +438,135 @@ static bool setupTFLite() {
     }
 
     return true;
+}
+
+// =============================================================================
+// BLE callbacks
+// =============================================================================
+static void ble_connect_callback(uint16_t conn_handle) {
+    BLEConnection* conn = Bluefruit.Connection(conn_handle);
+    char name[32] = {0};
+    conn->getPeerName(name, sizeof(name));
+    Serial.print("#BLE:CONNECTED  peer=");
+    Serial.println(name);
+}
+
+static void ble_disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+    (void)conn_handle;
+    Serial.print("#BLE:DISCONNECTED  reason=0x");
+    Serial.println(reason, HEX);
+}
+
+// =============================================================================
+// setupBLE — configure GATT service and characteristics
+// Must be called before startAdv()
+// =============================================================================
+static void setupBLE() {
+    Bluefruit.begin();
+    Bluefruit.setName("CO2-Beacon");
+    Bluefruit.Periph.setConnectCallback(ble_connect_callback);
+    Bluefruit.Periph.setDisconnectCallback(ble_disconnect_callback);
+
+    // ── CO₂ Beacon GATT service ───────────────────────────────────────────
+    co2_svc.begin();   // must call begin() on service before its characteristics
+
+    // ── LiveStatus characteristic — Notify, fixed 7 bytes ─────────────────
+    live_status_chr.setProperties(CHR_PROPS_NOTIFY);
+    live_status_chr.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+    live_status_chr.setFixedLen(7);
+    live_status_chr.begin();
+
+    // ── TripRecord characteristic — Read + Notify, fixed 20 bytes ─────────
+    trip_record_chr.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+    trip_record_chr.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+    trip_record_chr.setFixedLen(20);
+    // Initialise to all-zero so a read before first TRIP_END is well-defined
+    uint8_t zeroes[20] = {0};
+    trip_record_chr.begin();
+    trip_record_chr.write(zeroes, 20);
+}
+
+// =============================================================================
+// startAdv — configure and begin BLE advertising
+// =============================================================================
+static void startAdv() {
+    Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+    Bluefruit.Advertising.addTxPower();
+    Bluefruit.Advertising.addService(co2_svc);
+    Bluefruit.Advertising.addName();
+
+    // Auto-restart advertising after disconnect
+    Bluefruit.Advertising.restartOnDisconnect(true);
+    // Fast mode ~100 ms (160 × 0.625 ms), slow mode ~152 ms; fast for 30 s
+    Bluefruit.Advertising.setInterval(160, 244);
+    Bluefruit.Advertising.setFastTimeout(30);
+    Bluefruit.Advertising.start(0);   // 0 = advertise indefinitely
+}
+
+// =============================================================================
+// sendLiveStatus — build and notify 7-byte LiveStatus payload
+// Called at 1 Hz from loop()
+// =============================================================================
+static void sendLiveStatus() {
+    if (!Bluefruit.connected()) return;
+
+    uint32_t ts = millis() / 1000;
+    uint8_t  trip_active = (trip_distance_m > 0.0f) ? 1 : 0;
+
+    uint8_t payload[7];
+    payload[0] = cur_mode_id;
+    payload[1] = cur_confidence;
+    payload[2] = (uint8_t)(ts & 0xFF);
+    payload[3] = (uint8_t)((ts >>  8) & 0xFF);
+    payload[4] = (uint8_t)((ts >> 16) & 0xFF);
+    payload[5] = (uint8_t)((ts >> 24) & 0xFF);
+    payload[6] = trip_active;
+
+    live_status_chr.notify(payload, 7);
+}
+
+// =============================================================================
+// notifyTripRecord — build and notify 20-byte TripRecord payload on TRIP_END
+// trip_distance_m / trip_co2_g are still non-zero when this is called;
+// they are zeroed by the caller immediately after.
+// =============================================================================
+static void notifyTripRecord(uint32_t ts_end) {
+    uint16_t dur_s   = (uint16_t)constrain(
+                           (int32_t)(ts_end - trip_ts_start), 0, 65535);
+    uint16_t dist_u  = (uint16_t)constrain((int)trip_distance_m, 0, 65535);
+    uint16_t co2_u   = (uint16_t)constrain((int)trip_co2_g,      0, 65535);
+
+    uint8_t rec[20] = {0};
+    // [0-1]  trip_id  uint16 LE
+    rec[0] = (uint8_t)(trip_id & 0xFF);
+    rec[1] = (uint8_t)(trip_id >> 8);
+    // [2]    mode_id  (dominant motorised mode, or walk if all-walk)
+    rec[2] = trip_mode_id;
+    // [3]    confidence at trip end
+    rec[3] = cur_confidence;
+    // [4-7]  ts_start uint32 LE
+    rec[4] = (uint8_t)(trip_ts_start & 0xFF);
+    rec[5] = (uint8_t)(trip_ts_start >>  8);
+    rec[6] = (uint8_t)(trip_ts_start >> 16);
+    rec[7] = (uint8_t)(trip_ts_start >> 24);
+    // [8-11] ts_end   uint32 LE
+    rec[8]  = (uint8_t)(ts_end & 0xFF);
+    rec[9]  = (uint8_t)(ts_end >>  8);
+    rec[10] = (uint8_t)(ts_end >> 16);
+    rec[11] = (uint8_t)(ts_end >> 24);
+    // [12-13] duration_s uint16 LE
+    rec[12] = (uint8_t)(dur_s & 0xFF);
+    rec[13] = (uint8_t)(dur_s >> 8);
+    // [14-15] distance_m uint16 LE
+    rec[14] = (uint8_t)(dist_u & 0xFF);
+    rec[15] = (uint8_t)(dist_u >> 8);
+    // [16-17] co2_g    uint16 LE
+    rec[16] = (uint8_t)(co2_u & 0xFF);
+    rec[17] = (uint8_t)(co2_u >> 8);
+    // [18-19] reserved = 0x00 (already zero)
+
+    trip_record_chr.write(rec, 20);    // update readable value
+    if (Bluefruit.connected()) {
+        trip_record_chr.notify(rec, 20);
+    }
 }
