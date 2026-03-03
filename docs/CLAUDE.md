@@ -31,8 +31,9 @@ Sampling: 25 Hz | Window: 5s (125 samples) | Overlap: 50%
 - Window: 8s at 25Hz = 200 samples (WIN_N=200, STEP_N=100)
 - Input shape: (200, 7, 1)
 - Channels: ax_corr, ay_corr, az_corr, gx, gy, gz, pressure_hpa
-- Architecture: Conv2D(16,9×1) → MaxPool(2×1) → Conv2D(32,9×1) → 
-                MaxPool(2×1) → Flatten → Dense(64) → Dropout(0.3) → Dense(5, softmax)
+- Architecture: Conv2D(16,9×1) → MaxPool(2×1) → Conv2D(32,9×1) →
+                MaxPool(2×1) → Flatten → Dense(32) → Dropout(0.3) → Dense(5, softmax)
+- Model file: co2_beacon_int8.tflite — 361 KB (Dense(32) retrain, was 729 KB)
 - Modes: ['train','subway','car','bus','walk'] → IDs 0–4
 - Dataset: baseline_features_v4_segment_split_train_val_test.npz
 - Train: 360 windows (72/class), Val: 1019, Test: 440 (88/class)
@@ -82,7 +83,7 @@ Dataset file: data/processed/features/baseline_features_v3_segment_split_train_v
 | Requirement          | Target       | Status              |
 |----------------------|--------------|---------------------|
 | Classification acc   | ≥ 90%        | ✅ ~95–96% achieved |
-| Inference latency    | ≤ 1000ms     | 🔲 Not yet measured |
+| Inference latency    | ≤ 1000ms     | ✅ 259ms on hardware |
 | Battery runtime      | ≥ 24 hours   | 🔲 Not yet measured |
 | CO₂ RMSE             | ≤ 0.20 kg    | 🔲 CRITICAL MISSING |
 | Privacy              | No raw data via BLE | ✅ By design  |
@@ -116,18 +117,35 @@ edge-co2-beacon/
 
 ## Active GitHub Issues (check github.com/spaldrich13/edge-co2-beacon)
 Priority order this week:
-- #1  [TODAY] Convert Keras model to TFLite INT8
-- #2  [TODAY] Export normalization stats to norm_stats.h
-- #3  [TODAY] 25Hz sensor sampling loop firmware
-- #4  [DAY 2] Preprocessing pipeline in firmware
-- #5  [DAY 2] Deploy TFLite + run inference on-device
-- #6  [DAY 3] Measure inference latency (target ≤1000ms)
-- #8  [DAY 3] BLE GATT service implementation
+- #1  ✅ DONE  Convert Keras model to TFLite INT8 (Dense(32), 361KB)
+- #2  ✅ DONE  Export normalization stats to norm_stats.h
+- #3  ✅ DONE  25Hz sensor sampling loop — confirmed on hardware
+- #4  ✅ DONE  Preprocessing pipeline — norm + INT8 quantize confirmed on hardware
+- #5  ✅ DONE  TFLite inference on-device — output MODE:subway CONF:69% LAT:259ms
+- #6  ✅ DONE  Inference latency = 259ms (spec ≤1000ms) PASS
+- #8  [NEXT]  BLE GATT service implementation
 - #10 [DAY 4] Distance estimation module
 - #11 [DAY 4] CO₂ estimation module
 - #12 [DAY 4] Web dashboard (React + Web Bluetooth)
 - #13 [DAY 5] ⚠ FORMAL CO₂ RMSE VALIDATION — cannot be skipped
 - #7  [DAY 6] Battery runtime test — cannot be skipped
+
+---
+
+## Hardware Validation Results (2026-03-03)
+First successful hardware run on Adafruit Feather nRF52840:
+
+| Metric | Result | Spec | Status |
+|---|---|---|---|
+| Inference latency | **259 ms** | ≤ 1000 ms | ✅ PASS |
+| Flash used | 62% of 796 KB (≈ 493 KB) | — | ✅ |
+| RAM used | 28% of 232 KB (≈ 65 KB) | — | ✅ |
+| BNO055 init | OK at 0x28 | — | ✅ |
+| BMP390 init | OK at 0x77 | — | ✅ |
+| Serial output | `MODE:subway CONF:69% LAT:259ms` | — | ✅ |
+
+Firmware: `firmware/beacon_inference/beacon_inference.ino`
+Model: `co2_beacon_int8.tflite` — 361 KB, Dense(32), INT8 quantized
 
 ---
 
