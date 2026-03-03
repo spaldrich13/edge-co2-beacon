@@ -55,6 +55,34 @@ static const char* MODE_NAMES[N_MODES] = {
     "train", "subway", "car", "bus", "walk"
 };
 
+// ── Issue #10: speed model (m/s) — order matches MODE_NAMES ──────────────────
+// walk=1.4, car=11.1 (40km/h urban avg), bus=8.3 (30km/h), train=16.7 (60km/h), subway=13.9 (50km/h)
+static const float SPEED_MPS[N_MODES] = {
+    16.7f,  // 0: train
+    13.9f,  // 1: subway
+    11.1f,  // 2: car
+     8.3f,  // 3: bus
+     1.4f   // 4: walk
+};
+
+// ── Issue #11: CO₂ emission factors (kg/km) — EPA eGRID 2023 ─────────────────
+static const float CO2_KG_PER_KM[N_MODES] = {
+    0.035f,  // 0: train
+    0.041f,  // 1: subway
+    0.089f,  // 2: car
+    0.089f,  // 3: bus
+    0.000f   // 4: walk
+};
+
+// Each inference covers STEP_N samples at FS_HZ = 4.0 seconds of travel
+static const float INTERVAL_S = (float)STEP_N / (float)FS_HZ;   // 4.0 s
+
+// ── Trip accumulators (Issues #10, #11) ───────────────────────────────────────
+static float trip_distance_m = 0.0f;
+static float trip_co2_g      = 0.0f;
+static int   prev_mode_id    = -1;   // -1 = no prior inference
+static int   walk_streak     = 0;    // consecutive high-conf walk inferences
+
 // ── Sliding window ring buffer ────────────────────────────────────────────────
 // ring[t][c]: t=0 is the oldest sample, t=WIN_N-1 is the newest.
 // New samples are appended at ring[WIN_N-1] after shifting left by one row.
@@ -252,7 +280,42 @@ static void runInference() {
     uint32_t lat_ms    = latency_us / 1000;
     uint32_t lat_frac  = (latency_us % 1000) / 10;   // tenths of ms
 
-    // ── 4. Serial output ──────────────────────────────────────────────────
+    // ── 4. Issue #10: distance accumulation ──────────────────────────────
+    // Each step covers INTERVAL_S seconds at the mode's average speed.
+    const float delta_m = SPEED_MPS[best_id] * INTERVAL_S;
+    trip_distance_m += delta_m;
+
+    // ── 5. Issue #11: CO₂ accumulation ───────────────────────────────────
+    // co2_g += (delta_m / 1000) * factor_kg_per_km * 1000  = delta_m * factor
+    trip_co2_g += delta_m * CO2_KG_PER_KM[best_id];
+
+    // ── 6. Trip boundary detection — reset accumulators on trip end ──────
+    // Condition A: motorised → walk (arrived at destination)
+    bool trip_end = (prev_mode_id >= 0 && prev_mode_id != 4 && best_id == 4);
+
+    // Condition B: sustained walk ≥ 60 s at conf ≥ 80% (new walking segment)
+    if (best_id == 4 && confidence >= 80) {
+        walk_streak++;
+    } else {
+        walk_streak = 0;
+    }
+    if (walk_streak >= 15) {   // 15 × 4 s = 60 s
+        trip_end = true;
+        walk_streak = 0;
+    }
+
+    if (trip_end && trip_distance_m > 0.0f) {
+        Serial.print("TRIP_END  DIST:");
+        Serial.print(trip_distance_m, 1);
+        Serial.print("m  CO2:");
+        Serial.print(trip_co2_g, 1);
+        Serial.println("g");
+        trip_distance_m = 0.0f;
+        trip_co2_g      = 0.0f;
+    }
+    prev_mode_id = best_id;
+
+    // ── 7. Serial output — running totals ─────────────────────────────────
     Serial.print("MODE:");
     Serial.print(MODE_NAMES[best_id]);
     Serial.print("  CONF:");
@@ -262,7 +325,11 @@ static void runInference() {
     Serial.print(".");
     if (lat_frac < 10) Serial.print("0");
     Serial.print(lat_frac);
-    Serial.println("ms");
+    Serial.print("ms  DIST:");
+    Serial.print(trip_distance_m, 1);
+    Serial.print("m  CO2:");
+    Serial.print(trip_co2_g, 1);
+    Serial.println("g");
 }
 
 // =============================================================================
