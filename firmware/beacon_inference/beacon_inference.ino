@@ -64,8 +64,8 @@ static int   samples_in_buf      = 0;   // fills up to WIN_N on first pass
 static int   samples_since_infer = 0;   // resets to 0 after each inference
 
 // ── TFLite Micro ──────────────────────────────────────────────────────────────
-// 80 KB static arena — no heap allocation anywhere in this file.
-static const int ARENA_BYTES = 80 * 1024;
+// 50 KB static arena — no heap allocation anywhere in this file.
+static const int ARENA_BYTES = 50 * 1024;
 static uint8_t  tensor_arena[ARENA_BYTES];
 
 static tflite::MicroMutableOpResolver<6> resolver;
@@ -278,7 +278,7 @@ static bool setupTFLite() {
     resolver.AddReshape();
     resolver.AddQuantize();     // INT8 input dequantize node
 
-    const tflite::Model* model = tflite::GetModel(g_model_data);
+    const tflite::Model* model = tflite::GetModel(model_co2_beacon_int8_tflite);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         Serial.print("#ERROR:SCHEMA_MISMATCH  got=");
         Serial.print(model->version());
