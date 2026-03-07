@@ -83,7 +83,7 @@ Dataset file: data/processed/features/baseline_features_v3_segment_split_train_v
 | Requirement          | Target       | Status              |
 |----------------------|--------------|---------------------|
 | Classification acc   | ≥ 90%        | ✅ ~95–96% achieved |
-| Inference latency    | ≤ 1000ms     | ✅ 259ms on hardware |
+| Inference latency    | ≤ 1000ms     | ✅ 261.6ms mean (n=30, σ=0.7ms) |
 | Battery runtime      | ≥ 24 hours   | 🔲 Not yet measured |
 | CO₂ RMSE             | ≤ 0.20 kg    | 🔲 CRITICAL MISSING |
 | Privacy              | No raw data via BLE | ✅ By design  |
@@ -122,7 +122,7 @@ Priority order this week:
 - #3  ✅ DONE  25Hz sensor sampling loop — confirmed on hardware
 - #4  ✅ DONE  Preprocessing pipeline — norm + INT8 quantize confirmed on hardware
 - #5  ✅ DONE  TFLite inference on-device — output MODE:subway CONF:69% LAT:259ms
-- #6  ✅ DONE  Inference latency = 259ms (spec ≤1000ms) PASS
+- #6  ✅ DONE  Inference latency = 261.6ms mean (n=30, σ=0.7ms, spec ≤1000ms) PASS
 - #8  [NEXT]  BLE GATT service implementation
 - #10 [DAY 4] Distance estimation module
 - #11 [DAY 4] CO₂ estimation module
@@ -146,6 +146,20 @@ First successful hardware run on Adafruit Feather nRF52840:
 
 Firmware: `firmware/beacon_inference/beacon_inference.ino`
 Model: `co2_beacon_int8.tflite` — 361 KB, Dense(32), INT8 quantized
+
+## Latency Formal Measurement (2026-03-06, n=30)
+Measured via Python/pyserial from live serial output:
+
+| Stat   | Value    |
+|--------|----------|
+| Mean   | 261.6 ms |
+| Stdev  | 0.7 ms   |
+| Min    | 261 ms   |
+| Max    | 264 ms   |
+| Median | 262.0 ms |
+
+Raw data: `logs/latency_readings.csv`
+Spec: ≤ 1000 ms — **PASS** (margin: 738 ms, 74% headroom)
 
 ---
 
