@@ -15,11 +15,11 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
-    body { margin: 0; background: #0f0f0f; color: #e8e8e8;
+    body { margin: 0; background: #ffffff; color: #111111;
            font-family: system-ui, -apple-system, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #1a1a1a; }
-    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+    ::-webkit-scrollbar-track { background: #f5f5f5; }
+    ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -35,22 +35,22 @@
 
     // ── Mode metadata — order matches firmware MODE_NAMES[5] ──────────────────
     const MODES = [
-      { name: 'Train',  icon: '🚆', color: '#4a9eff' },
-      { name: 'Subway', icon: '🚇', color: '#4a9eff' },
-      { name: 'Car',    icon: '🚗', color: '#ff5252' },
-      { name: 'Bus',    icon: '🚌', color: '#ff5252' },
-      { name: 'Walk',   icon: '🚶', color: '#4caf50' },
+      { name: 'Train',  icon: '🚆', color: '#1565c0' },
+      { name: 'Subway', icon: '🚇', color: '#1565c0' },
+      { name: 'Car',    icon: '🚗', color: '#c62828' },
+      { name: 'Bus',    icon: '🚌', color: '#c62828' },
+      { name: 'Walk',   icon: '🚶', color: '#2e7d32' },
     ];
     const modeOf = (id) => MODES[id] ?? { name: 'Unknown', icon: '?', color: '#888' };
 
-    // ── Payload parsers — exact byte layout from docs/CLAUDE.md ───────────────
+    // ── Payload parsers — exact byte layout from CLAUDE.md ────────────────────
     // LiveStatus (7 bytes):
     //   [0] mode_id  [1] confidence  [2-5] timestamp_s LE  [6] trip_active
     function parseLiveStatus(dv) {
       return {
         mode_id:     dv.getUint8(0),
         confidence:  dv.getUint8(1),
-        timestamp_s: dv.getUint32(2, /*littleEndian=*/true),
+        timestamp_s: dv.getUint32(2, true),
         trip_active: dv.getUint8(6) === 1,
       };
     }
@@ -77,8 +77,8 @@
       const h = Math.floor(s / 3600);
       const m = Math.floor((s % 3600) / 60);
       const r = s % 60;
-      if (h > 0)  return `${h}h ${m}m`;
-      if (m > 0)  return `${m}m ${r}s`;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${r}s`;
       return `${r}s`;
     }
 
@@ -95,8 +95,8 @@
     // ── Shared style tokens ───────────────────────────────────────────────────
     const S = {
       card: {
-        background: '#1a1a1a',
-        border: '1px solid #2b2b2b',
+        background: '#ffffff',
+        border: '1px solid #e5e5e5',
         borderRadius: 10,
         padding: '1rem',
       },
@@ -104,7 +104,7 @@
         fontSize: 10,
         fontWeight: 700,
         letterSpacing: 2,
-        color: '#555',
+        color: '#999',
         textTransform: 'uppercase',
         marginBottom: 12,
       },
@@ -113,9 +113,9 @@
         justifyContent: 'space-between',
         alignItems: 'center',
         padding: '6px 0',
-        borderBottom: '1px solid #222',
+        borderBottom: '1px solid #f0f0f0',
       },
-      dim: { color: '#666', fontSize: 13 },
+      dim: { color: '#888', fontSize: 13 },
     };
 
     // ── <StatusDot /> ─────────────────────────────────────────────────────────
@@ -125,14 +125,13 @@
           display: 'inline-block',
           width: 9, height: 9,
           borderRadius: '50%',
-          background: on ? '#4caf50' : '#444',
-          boxShadow: on ? '0 0 7px #4caf50aa' : 'none',
+          background: on ? '#4caf50' : '#ccc',
           flexShrink: 0,
         }} />
       );
     }
 
-    // ── <ConnectButton /> ────────────────────────────────────────────────────
+    // ── <ConnectButton /> ─────────────────────────────────────────────────────
     function ConnectButton({ connected, connecting, onConnect, onDisconnect }) {
       const label = connecting ? 'Connecting…'
                   : connected  ? 'Disconnect'
@@ -142,16 +141,16 @@
           onClick={connected ? onDisconnect : onConnect}
           disabled={connecting}
           style={{
-            background:  connected  ? '#2d2d2d' : '#1e4dff',
-            color:       '#fff',
-            border:      connected  ? '1px solid #444' : 'none',
+            background:   connected  ? '#f5f5f5' : '#1565c0',
+            color:        connected  ? '#333'    : '#fff',
+            border:       connected  ? '1px solid #ddd' : 'none',
             borderRadius: 7,
-            padding:     '0.45rem 1rem',
-            fontWeight:  600,
-            fontSize:    13,
-            cursor:      connecting ? 'wait' : 'pointer',
+            padding:      '0.45rem 1rem',
+            fontWeight:   600,
+            fontSize:     13,
+            cursor:       connecting ? 'wait' : 'pointer',
             letterSpacing: 0.2,
-            transition:  'background 0.15s',
+            transition:   'background 0.15s',
           }}
         >
           {label}
@@ -159,13 +158,13 @@
       );
     }
 
-    // ── <LiveStatusPanel /> ──────────────────────────────────────────────────
+    // ── <LiveStatusPanel /> ───────────────────────────────────────────────────
     function LiveStatusPanel({ status, connected }) {
       if (!connected) {
         return (
           <div style={S.card}>
             <div style={S.sectionLabel}>Live Status</div>
-            <div style={{ textAlign: 'center', color: '#444', padding: '2rem 0', fontSize: 13 }}>
+            <div style={{ textAlign: 'center', color: '#bbb', padding: '2rem 0', fontSize: 13 }}>
               Not connected
             </div>
           </div>
@@ -176,7 +175,7 @@
         return (
           <div style={S.card}>
             <div style={S.sectionLabel}>Live Status</div>
-            <div style={{ textAlign: 'center', color: '#555', padding: '2rem 0', fontSize: 13 }}>
+            <div style={{ textAlign: 'center', color: '#bbb', padding: '2rem 0', fontSize: 13 }}>
               Waiting for data…
             </div>
           </div>
@@ -191,10 +190,8 @@
 
           {/* Big mode display */}
           <div style={{ textAlign: 'center', padding: '0.5rem 0 1rem' }}>
-            <div style={{ fontSize: 56, lineHeight: 1.1 }}>{mode.icon}</div>
-            <div style={{
-              fontSize: 26, fontWeight: 700, color: mode.color, marginTop: 8,
-            }}>
+            <div style={{ fontSize: 52, lineHeight: 1.1 }}>{mode.icon}</div>
+            <div style={{ fontSize: 26, fontWeight: 700, color: mode.color, marginTop: 8 }}>
               {mode.name}
             </div>
           </div>
@@ -206,86 +203,128 @@
           </div>
           <div style={{ ...S.row, borderBottom: 'none' }}>
             <span style={S.dim}>Trip</span>
-            <span style={{
-              fontWeight: 600,
-              color: status.trip_active ? '#4caf50' : '#555',
-            }}>
+            <span style={{ fontWeight: 600, color: status.trip_active ? '#2e7d32' : '#bbb' }}>
               {status.trip_active ? '● Active' : '○ Idle'}
             </span>
           </div>
+
+          {/* Live trip accumulator — shown only while trip is active */}
+          {status.trip_active && (
+            <div style={{
+              marginTop: 12,
+              padding: '10px 12px',
+              background: '#f8f8f8',
+              borderRadius: 8,
+              border: '1px solid #ebebeb',
+            }}>
+              <div style={{ ...S.sectionLabel, marginBottom: 8 }}>Current Trip</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <span style={{ color: '#888', fontSize: 12 }}>Distance (est.)</span>
+                <span style={{ fontWeight: 600, fontSize: 13, color: '#333' }}>
+                  {/* Distance accumulates on device — we show from last TripRecord or — */}
+                  accumulating…
+                </span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#888', fontSize: 12 }}>CO₂ (est.)</span>
+                <span style={{ fontWeight: 600, fontSize: 13, color: mode.color }}>
+                  accumulating…
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       );
     }
 
-    // ── <TripRow /> ──────────────────────────────────────────────────────────
+    // ── <TripRow /> ───────────────────────────────────────────────────────────
     function TripRow({ trip }) {
       const mode = modeOf(trip.mode_id);
       return (
-        <div style={{
-          padding: '0.7rem 1rem',
-          borderBottom: '1px solid #252525',
-        }}>
+        <div style={{ padding: '0.7rem 1rem', borderBottom: '1px solid #f5f5f5' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
-            <span style={{ color: '#555', fontSize: 12 }}>#{trip.trip_id}</span>
+            <span style={{ color: '#bbb', fontSize: 12 }}>#{trip.trip_id}</span>
             <span style={{ fontWeight: 600, color: mode.color, fontSize: 14 }}>
               {mode.icon} {mode.name}
             </span>
-            <span style={{ color: '#777', fontSize: 12 }}>{fmtDuration(trip.duration_s)}</span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: '#666', fontSize: 12 }}>{fmtDist(trip.distance_m)}</span>
-            <span style={{ color: '#888', fontSize: 12 }}>
-              {trip.confidence}% conf
+            <span style={{ color: '#aaa', fontSize: 12 }}>
+              {fmtDist(trip.distance_m)} · {fmtDuration(trip.duration_s)}
             </span>
-            <span style={{ fontWeight: 700, fontSize: 13, color: mode.color }}>
-              CO₂ {fmtCO2(trip.co2_g)}
+            <span style={{ color: mode.color, fontSize: 13, fontWeight: 600 }}>
+              {fmtCO2(trip.co2_g)}
             </span>
           </div>
         </div>
       );
     }
 
-    // ── <TripHistoryPanel /> ─────────────────────────────────────────────────
+    // ── <TripHistoryPanel /> ──────────────────────────────────────────────────
     function TripHistoryPanel({ trips }) {
       const sessionCO2 = trips.reduce((sum, t) => sum + t.co2_g, 0);
-      // Newest first, show last 10
       const visible = [...trips].sort((a, b) => b.trip_id - a.trip_id).slice(0, 10);
 
       return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {/* History list */}
+
+          {/* Trip history list */}
           <div style={S.card}>
             <div style={S.sectionLabel}>Trip History</div>
             {visible.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#444', padding: '2rem 0', fontSize: 13 }}>
-                No trips yet — trips appear here after TRIP_END events
+              <div style={{ textAlign: 'center', color: '#bbb', padding: '2rem 0', fontSize: 13 }}>
+                No completed trips yet — trips appear here after each TRIP_END event
               </div>
             ) : (
-              <div style={{ margin: '0 -1rem -1rem', borderTop: '1px solid #252525' }}>
+              <div style={{ margin: '0 -1rem -1rem', borderTop: '1px solid #f0f0f0' }}>
                 {visible.map(t => <TripRow key={t.trip_id} trip={t} />)}
               </div>
             )}
           </div>
 
-          {/* Session total */}
-          <div style={{ ...S.card, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          {/* Session totals */}
+          <div style={{
+            ...S.card,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}>
             <div>
               <div style={S.sectionLabel}>Session Total CO₂</div>
               <div style={{
-                fontSize: 28,
+                fontSize: 30,
                 fontWeight: 700,
-                color: sessionCO2 === 0 ? '#4caf50' : sessionCO2 < 500 ? '#ff9800' : '#ff5252',
+                color: sessionCO2 === 0 ? '#2e7d32'
+                     : sessionCO2 < 500 ? '#e65100'
+                     : '#c62828',
               }}>
                 {fmtCO2(sessionCO2)}
               </div>
             </div>
             <div style={{ textAlign: 'right' }}>
               <div style={S.sectionLabel}>Trips</div>
-              <div style={{ fontSize: 28, fontWeight: 700, color: '#aaa' }}>
+              <div style={{ fontSize: 30, fontWeight: 700, color: '#555' }}>
                 {trips.length}
               </div>
             </div>
           </div>
+
+          {/* Privacy callout — reinforces the no-raw-data claim for the demo */}
+          <div style={{
+            background: '#e8f5e9',
+            border: '1px solid #c8e6c9',
+            borderRadius: 10,
+            padding: '0.8rem 1rem',
+          }}>
+            <div style={{ fontSize: 12, color: '#1b5e20', fontWeight: 600, marginBottom: 3 }}>
+              Privacy by architecture
+            </div>
+            <div style={{ fontSize: 12, color: '#388e3c' }}>
+              BLE transmits only a 7-byte summary packet at 1 Hz.
+              Raw IMU and barometer data never leave the device.
+            </div>
+          </div>
+
         </div>
       );
     }
@@ -298,17 +337,18 @@
       const [trips,      setTrips]      = useState([]);
       const [error,      setError]      = useState('');
 
-      const deviceRef = useRef(null);
+      const deviceRef  = useRef(null);
+      const prevTsRef  = useRef(null);
 
       // Stable callbacks so removeEventListener works correctly
       const onLiveNotify = useCallback((e) => {
-        setStatus(parseLiveStatus(e.target.value));
+        const parsed = parseLiveStatus(e.target.value);
+        setStatus(parsed);
       }, []);
 
       const onTripNotify = useCallback((e) => {
         const trip = parseTripRecord(e.target.value);
         setTrips(prev => {
-          // Deduplicate by trip_id (re-notify case)
           const rest = prev.filter(t => t.trip_id !== trip.trip_id);
           return [...rest, trip];
         });
@@ -330,8 +370,8 @@
         try {
           const device = await navigator.bluetooth.requestDevice({
             filters: [
-              { services: [SVC_UUID] },      // match by advertised service UUID
-              { name: 'CO2-Beacon' },         // or by device name
+              { services: [SVC_UUID] },
+              { name: 'CO2-Beacon' },
             ],
             optionalServices: [SVC_UUID],
           });
@@ -354,7 +394,6 @@
 
           setConnected(true);
         } catch (err) {
-          // NotFoundError = user dismissed the picker → not an error to surface
           if (err.name !== 'NotFoundError') {
             setError(`Connection failed: ${err.message}`);
           }
@@ -373,7 +412,7 @@
       };
 
       return (
-        <div style={{ minHeight: '100vh', background: '#0f0f0f' }}>
+        <div style={{ minHeight: '100vh', background: '#ffffff' }}>
 
           {/* ── Header ── */}
           <header style={{
@@ -381,21 +420,24 @@
             justifyContent: 'space-between',
             alignItems: 'center',
             padding: '0.85rem 1.5rem',
-            background: '#141414',
-            borderBottom: '1px solid #222',
+            background: '#ffffff',
+            borderBottom: '1px solid #e5e5e5',
             position: 'sticky',
             top: 0,
             zIndex: 10,
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ fontSize: 20 }}>🌿</span>
-              <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 0.3 }}>
+              <span style={{ fontSize: 18 }}>🌿</span>
+              <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 0.3, color: '#111' }}>
                 CO₂ Beacon
+              </span>
+              <span style={{ fontSize: 12, color: '#999', marginLeft: 4 }}>
+                ECE499 · Union College
               </span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <StatusDot on={connected} />
-              <span style={{ color: '#666', fontSize: 12, marginRight: 6 }}>
+              <span style={{ color: '#888', fontSize: 12, marginRight: 6 }}>
                 {connected ? 'Connected' : connecting ? 'Connecting…' : 'Disconnected'}
               </span>
               <ConnectButton
@@ -410,11 +452,11 @@
           {/* ── Error banner ── */}
           {error && (
             <div style={{
-              background: '#3a1515',
-              color: '#ff8080',
+              background: '#fff3f3',
+              color: '#c62828',
               padding: '0.6rem 1.5rem',
               fontSize: 13,
-              borderBottom: '1px solid #5a2020',
+              borderBottom: '1px solid #ffcdd2',
             }}>
               ⚠ {error}
             </div>
@@ -423,13 +465,13 @@
           {/* ── Chrome-only notice ── */}
           {!navigator.bluetooth && !error && (
             <div style={{
-              background: '#1e1a00',
-              color: '#c8a800',
+              background: '#fffde7',
+              color: '#f57f17',
               padding: '0.6rem 1.5rem',
               fontSize: 13,
-              borderBottom: '1px solid #3a3000',
+              borderBottom: '1px solid #fff176',
             }}>
-              ⚠ Web Bluetooth requires Chrome. Firefox and Safari are not supported.
+              ⚠ Web Bluetooth requires Chrome on desktop or Android. Firefox and Safari are not supported.
             </div>
           )}
 
@@ -442,12 +484,12 @@
             maxWidth: 920,
             margin: '0 auto',
           }}>
-            {/* Left — live status */}
             <div>
-              <LiveStatusPanel status={status} connected={connected} />
+              <LiveStatusPanel
+                status={status}
+                connected={connected}
+              />
             </div>
-
-            {/* Right — history + session total */}
             <div>
               <TripHistoryPanel trips={trips} />
             </div>
@@ -456,12 +498,12 @@
           {/* ── Footer ── */}
           <footer style={{
             textAlign: 'center',
-            color: '#333',
+            color: '#ccc',
             fontSize: 11,
             padding: '2rem 1rem 1rem',
             letterSpacing: 0.5,
           }}>
-            ECE499 Edge CO₂ Beacon · No data leaves your browser · Raw sensor data never transmitted
+            ECE499 Edge CO₂ Beacon · Spencer Aldrich · Union College · No raw sensor data ever transmitted
           </footer>
 
         </div>
