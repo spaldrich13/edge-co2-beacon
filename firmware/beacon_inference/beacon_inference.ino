@@ -1,75 +1,62 @@
 // beacon_inference.ino
-// Issues #3-#6 (sampling/preprocessing/inference/latency) ✅
-// Issue #8  (BLE GATT — LiveStatus + TripRecord)
-// Issues #10-#11 (distance + CO₂ estimation)
-//
-// Hardware confirmed from LOGGER_BUTTON_v1.3:
-//   BNO055 I2C 0x28 | BMP390 I2C 0x77 | 400 kHz bus
-//
-// Inference pipeline:
-//   Sample 25 Hz → ring buffer (200 × 7) → z-score normalize → INT8 quantize
-//   → TFLite Micro → argmax → distance/CO₂ accumulate → BLE notify + Serial print
+// ECE499 Capstone — Edge CO₂ Beacon
+// Spencer Aldrich | Union College | 2026
 
-#include <bluefruit.h>   // Bluefruit52Lib — Adafruit nRF52 core BLE stack
+#define DEBUG_RAW 0
 
+#include <bluefruit.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
-#include <Adafruit_BMP3XX.h>
+// #include <Adafruit_BMP3XX.h> 
 #include <math.h>
-
 #include <TensorFlowLite.h>
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+#include "model_data.h"
+#include "norm_stats.h"
 
-#include "model_data.h"   // g_model_data[], g_model_data_len  (xxd output)
-#include "norm_stats.h"   // NORM_MU[7], NORM_SIGMA[7]
-
-// ── Hardware ─────────────────────────────────────────────────────────────────
-#define LED_PIN       LED_BUILTIN
-#define BMP3_ADDR     0x77    // confirmed: matches LOGGER_BUTTON_v1.3
+// Hardware 
+#define LED_PIN   LED_BUILTIN
 
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
-Adafruit_BMP3XX bmp;
 
-// ── Accelerometer bias (m/s²) — from logging firmware / docs/API_INTEGRATIONS.md
+// Accelerometer bias (m/s²) — measured from logging firmware 
 static const float ACC_BIAS_X = -0.1926f;
 static const float ACC_BIAS_Y = -0.1975f;
 static const float ACC_BIAS_Z = -0.3472f;
 
-// ── Sampling ──────────────────────────────────────────────────────────────────
+// Sampling 
 static const uint32_t FS_HZ     = 25;
-static const uint32_t PERIOD_US = 1000000UL / FS_HZ;   // 40 000 µs
+static const uint32_t PERIOD_US = 1000000UL / FS_HZ;  // 40 000 µs
 static uint32_t nextTickUs      = 0;
 
-// ── Window parameters (must match Python windowing in window_build.py) ────────
-static const int WIN_N      = 200;   // 8 s × 25 Hz
-static const int STEP_N     = 100;   // 50% overlap → inference every 4 s
-static const int N_CHANNELS = 7;     // ax, ay, az, gx, gy, gz, pressure_hpa
+// Window parameters 
+static const int WIN_N      = 200;  // 8 s × 25 Hz
+static const int STEP_N     = 100;  // 50% overlap → inference every 4 s
 
-// ── INT8 quantization params (confirmed from convert_to_tflite.py output) ─────
-static const float QUANT_SCALE      = 0.5251754522f;
-static const int   QUANT_ZERO_POINT = 113;
+// INT8 quantization params 
+static const float QUANT_SCALE      = 0.04095628f;
+static const int   QUANT_ZERO_POINT = -56;
 
-// ── Mode labels — order must match model output layer ─────────────────────────
+// Mode labels — must match model output layer order
 static const int   N_MODES = 5;
 static const char* MODE_NAMES[N_MODES] = {
     "train", "subway", "car", "bus", "walk"
 };
 
-// ── Issue #10: speed model (m/s) — order matches MODE_NAMES ──────────────────
-// walk=1.4, car=11.1 (40km/h urban avg), bus=8.3 (30km/h), train=16.7 (60km/h), subway=13.9 (50km/h)
+// Speed model (m/s) used for distance accumulation
 static const float SPEED_MPS[N_MODES] = {
-    16.7f,  // 0: train
-    13.9f,  // 1: subway
-    11.1f,  // 2: car
-     8.3f,  // 3: bus
-     1.4f   // 4: walk
+    22.2f,  // 0: train  (80 km/h)
+    8.3f,   // 1: subway (30 km/h)
+    11.1f,  // 2: car    (40 km/h)
+    5.6f,   // 3: bus    (20 km/h)
+    1.4f    // 4: walk   ( 5 km/h)
 };
 
-// ── Issue #11: CO₂ emission factors (kg/km) — EPA eGRID 2023 ─────────────────
+// CO₂ emission factors (kg/km) — EPA eGRID 2023 
 static const float CO2_KG_PER_KM[N_MODES] = {
     0.035f,  // 0: train
     0.041f,  // 1: subway
@@ -78,48 +65,39 @@ static const float CO2_KG_PER_KM[N_MODES] = {
     0.000f   // 4: walk
 };
 
-// Each inference covers STEP_N samples at FS_HZ = 4.0 seconds of travel
-static const float INTERVAL_S = (float)STEP_N / (float)FS_HZ;   // 4.0 s
+// Seconds of real time each inference step represents
+static const float INTERVAL_S = (float)STEP_N / (float)FS_HZ;  // 4.0 s
 
-// ── Trip accumulators (Issues #10, #11) ───────────────────────────────────────
-static float trip_distance_m = 0.0f;
-static float trip_co2_g      = 0.0f;
-static int   prev_mode_id    = -1;   // -1 = no prior inference
-static int   walk_streak     = 0;    // consecutive high-conf walk inferences
+// Trip accumulators
+static float    trip_distance_m = 0.0f;
+static float    trip_co2_g      = 0.0f;
+static int      prev_mode_id    = -1;
+static int      walk_streak     = 0;
+static bool     trip_active     = false;
 
-// ── BLE GATT service (Issue #8) ───────────────────────────────────────────────
-// Service UUID and characteristic UUIDs (128-bit, custom)
+// BLE GATT
 #define CO2_SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c3319100"
 #define LIVE_CHR_UUID "4fafc201-1fb5-459e-8fcc-c5c9c3319101"
 #define TRIP_CHR_UUID "4fafc201-1fb5-459e-8fcc-c5c9c3319102"
 
 BLEService        co2_svc(CO2_SVC_UUID);
-BLECharacteristic live_status_chr(LIVE_CHR_UUID);  // Notify, 7 bytes
-BLECharacteristic trip_record_chr(TRIP_CHR_UUID);  // Read+Notify, 20 bytes
+BLECharacteristic live_status_chr(LIVE_CHR_UUID);
+BLECharacteristic trip_record_chr(TRIP_CHR_UUID);
 
-// Trip metadata written into TripRecord on TRIP_END
-static uint16_t trip_id       = 0;      // increments each TRIP_END
-static uint32_t trip_ts_start = 0;      // seconds since boot, set at trip start
-static uint8_t  trip_mode_id  = 0;      // dominant mode (last non-walk seen)
-
-// Current inference result — shared between runInference() and loop()
-static uint8_t  cur_mode_id   = 0;
-static uint8_t  cur_confidence = 0;
-
-// 1 Hz LiveStatus timer (independent of 25 Hz inference tick)
+static uint16_t trip_id            = 0;
+static uint32_t trip_ts_start      = 0;
+static uint8_t  trip_mode_id       = 0;
+static uint8_t  cur_mode_id        = 0;
+static uint8_t  cur_confidence     = 0;
 static uint32_t ble_last_notify_ms = 0;
 
-// ── Sliding window ring buffer ────────────────────────────────────────────────
-// ring[t][c]: t=0 is the oldest sample, t=WIN_N-1 is the newest.
-// New samples are appended at ring[WIN_N-1] after shifting left by one row.
-// This gives a contiguous, time-ordered buffer ready for normalization.
+// Sliding window ring buffer
 static float ring[WIN_N][N_CHANNELS];
-static int   samples_in_buf      = 0;   // fills up to WIN_N on first pass
-static int   samples_since_infer = 0;   // resets to 0 after each inference
+static int   samples_in_buf      = 0;
+static int   samples_since_infer = 0;
 
-// ── TFLite Micro ──────────────────────────────────────────────────────────────
-// 50 KB static arena — no heap allocation anywhere in this file.
-static const int ARENA_BYTES = 50 * 1024;
+// TFLite Micro 
+static const int ARENA_BYTES = 130 * 1024;
 static uint8_t  tensor_arena[ARENA_BYTES];
 
 static tflite::MicroMutableOpResolver<6> resolver;
@@ -127,17 +105,18 @@ static tflite::MicroInterpreter*         interpreter   = nullptr;
 static TfLiteTensor*                     input_tensor  = nullptr;
 static TfLiteTensor*                     output_tensor = nullptr;
 
-// ── Forward declarations ──────────────────────────────────────────────────────
+// Forward declarations
 static bool setupTFLite();
 static void pushSample(float ax, float ay, float az,
-                       float gx, float gy, float gz, float pres);
+                       float gx, float gy, float gz);
 static void runInference();
 static void setupBLE();
 static void startAdv();
 static void sendLiveStatus();
 static void notifyTripRecord(uint32_t ts_end);
+static void resetTrip();
 
-// =============================================================================
+// setup
 void setup() {
     Serial.begin(115200);
     unsigned long t0 = millis();
@@ -146,31 +125,19 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
-    // ── I²C — 400 kHz fast mode ───────────────────────────────────────────
     Wire.begin();
     Wire.setClock(400000);
 
-    // ── BNO055 ────────────────────────────────────────────────────────────
+    // BNO055
     if (!bno.begin()) {
         Serial.println("#ERROR:BNO055_NOT_FOUND");
         while (1) delay(10);
     }
-    delay(1000);                    // BNO055 datasheet: wait after begin()
-    bno.setExtCrystalUse(true);     // use external crystal for accuracy
+    delay(1000);
+    bno.setExtCrystalUse(true);
     Serial.println("#OK:BNO055");
 
-    // ── BMP390 ────────────────────────────────────────────────────────────
-    if (!bmp.begin_I2C(BMP3_ADDR)) {
-        Serial.println("#ERROR:BMP390_NOT_FOUND");
-        while (1) delay(10);
-    }
-    bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
-    bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
-    bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-    bmp.setOutputDataRate(BMP3_ODR_50_HZ);
-    Serial.println("#OK:BMP390");
-
-    // ── TFLite Micro ──────────────────────────────────────────────────────
+    // TFLite Micro 
     if (!setupTFLite()) {
         Serial.println("#ERROR:TFLITE_INIT_FAILED");
         while (1) delay(10);
@@ -179,38 +146,41 @@ void setup() {
     Serial.print(interpreter->arena_used_bytes());
     Serial.println("B");
 
-    // ── BLE ───────────────────────────────────────────────────────────────
+    // BLE 
     setupBLE();
     startAdv();
     Serial.println("#OK:BLE  advertising as CO2-Beacon");
 
-    // ── Boot summary ──────────────────────────────────────────────────────
-    Serial.print("#CONFIG  WIN=");   Serial.print(WIN_N);
-    Serial.print(" STEP=");          Serial.print(STEP_N);
-    Serial.print(" FS=");            Serial.print(FS_HZ);
+    // Boot summary
+    Serial.print("#CONFIG  WIN=");  Serial.print(WIN_N);
+    Serial.print(" STEP=");         Serial.print(STEP_N);
+    Serial.print(" FS=");           Serial.print(FS_HZ);
     Serial.print("Hz  filling buffer (");
     Serial.print(WIN_N / FS_HZ);
     Serial.println("s)...");
 
+#if DEBUG_RAW
+    Serial.println("#DEBUG_RAW ON — raw sensor + softmax printed each inference");
+#endif
+
     digitalWrite(LED_PIN, HIGH);
     nextTickUs = micros();
 }
-
-// =============================================================================
+// loop
 void loop() {
-    // ── 1 Hz BLE LiveStatus notification (independent of inference tick) ──
+    // 1 Hz BLE LiveStatus
     uint32_t now_ms = millis();
     if (now_ms - ble_last_notify_ms >= 1000UL) {
         ble_last_notify_ms = now_ms;
         sendLiveStatus();
     }
 
-    // ── Exact 25 Hz tick via micros() — no delay() ───────────────────────
+    // 25 Hz tick
     uint32_t nowUs = micros();
     if ((int32_t)(nowUs - nextTickUs) < 0) return;
     nextTickUs += PERIOD_US;
 
-    // ── BNO055: bias-corrected accelerometer + gyroscope ─────────────────
+    // Read sensors
     imu::Vector<3> aRaw = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
     float ax = aRaw.x() - ACC_BIAS_X;
     float ay = aRaw.y() - ACC_BIAS_Y;
@@ -221,31 +191,21 @@ void loop() {
     float gy = gRaw.y();
     float gz = gRaw.z();
 
-    // ── BMP390: pressure — fall back to training mean if read fails ───────
-    float pressure_hpa = NORM_MU[6];   // 1014.45 hPa — won't skew normalize
-    if (bmp.performReading()) {
-        pressure_hpa = bmp.pressure / 100.0f;
-    }
-
-    pushSample(ax, ay, az, gx, gy, gz, pressure_hpa);
+    pushSample(ax, ay, az, gx, gy, gz);
 }
 
-// =============================================================================
-// pushSample — maintain sliding window, trigger inference every STEP_N samples
-// =============================================================================
+// pushSample — maintains sliding window ring buffer, fires inference every STEP_N
 static void pushSample(float ax, float ay, float az,
-                       float gx, float gy, float gz, float pres) {
+                       float gx, float gy, float gz) {
+    // initial fill
     if (samples_in_buf < WIN_N) {
-        // Phase 1: filling the buffer for the first time
         ring[samples_in_buf][0] = ax;
         ring[samples_in_buf][1] = ay;
         ring[samples_in_buf][2] = az;
         ring[samples_in_buf][3] = gx;
         ring[samples_in_buf][4] = gy;
         ring[samples_in_buf][5] = gz;
-        ring[samples_in_buf][6] = pres;
         samples_in_buf++;
-
         if (samples_in_buf == WIN_N) {
             runInference();
             samples_since_infer = 0;
@@ -253,9 +213,7 @@ static void pushSample(float ax, float ay, float az,
         return;
     }
 
-    // Phase 2: sliding window — shift left by one row, append at tail
-    // (WIN_N-1) rows × N_CHANNELS floats = 1393 floats = 5572 bytes
-    // On Cortex-M4 @ 64 MHz this takes ~5 µs, well within 40 ms tick budget.
+    // sliding — shift left by one sample, append new
     memmove(&ring[0][0], &ring[1][0],
             sizeof(float) * (WIN_N - 1) * N_CHANNELS);
     ring[WIN_N - 1][0] = ax;
@@ -264,7 +222,6 @@ static void pushSample(float ax, float ay, float az,
     ring[WIN_N - 1][3] = gx;
     ring[WIN_N - 1][4] = gy;
     ring[WIN_N - 1][5] = gz;
-    ring[WIN_N - 1][6] = pres;
 
     samples_since_infer++;
     if (samples_since_infer >= STEP_N) {
@@ -273,14 +230,11 @@ static void pushSample(float ax, float ay, float az,
     }
 }
 
-// =============================================================================
-// runInference — normalize → INT8 quantize → Invoke → dequantize → print
-// =============================================================================
+// runInference — normalize → quantize → invoke → dequantize → accumulate
 static void runInference() {
     uint32_t t_start = micros();
 
-    // ── 1. Z-score normalize + INT8 quantize into input tensor ───────────
-    // Input tensor shape: (1, 200, 7, 1) — flat index = t*N_CHANNELS + c
+    // Z-score normalize + INT8 quantize into TFLite input tensor
     int8_t* inp = input_tensor->data.int8;
     for (int t = 0; t < WIN_N; t++) {
         for (int c = 0; c < N_CHANNELS; c++) {
@@ -293,7 +247,7 @@ static void runInference() {
         }
     }
 
-    // ── 2. Run inference ──────────────────────────────────────────────────
+    // Run the model
     TfLiteStatus status = interpreter->Invoke();
     uint32_t latency_us = micros() - t_start;
 
@@ -302,115 +256,114 @@ static void runInference() {
         return;
     }
 
-    // ── 3. Dequantize output softmax → find argmax ────────────────────────
-    // Output tensor shape: (1, 5)
+    // Dequantize output softmax
     int8_t* out_q     = output_tensor->data.int8;
     float   out_scale = output_tensor->params.scale;
     int     out_zp    = output_tensor->params.zero_point;
 
     int   best_id   = 0;
     float best_prob = -1.0f;
+    float all_probs[N_MODES];
     for (int i = 0; i < N_MODES; i++) {
-        float prob = ((float)out_q[i] - (float)out_zp) * out_scale;
-        if (prob > best_prob) {
-            best_prob = prob;
-            best_id   = i;
-        }
+        float prob   = ((float)out_q[i] - (float)out_zp) * out_scale;
+        all_probs[i] = prob;
+        if (prob > best_prob) { best_prob = prob; best_id = i; }
     }
 
-    uint8_t confidence = (uint8_t)constrain((int)(best_prob * 100.0f + 0.5f), 0, 100);
-    uint32_t lat_ms    = latency_us / 1000;
-    uint32_t lat_frac  = (latency_us % 1000) / 10;   // tenths of ms
+    uint8_t  confidence = (uint8_t)constrain((int)(best_prob * 100.0f + 0.5f), 0, 100);
+    uint32_t lat_ms     = latency_us / 1000;
+    uint32_t lat_frac   = (latency_us % 1000) / 10;
 
-    // ── 4. Update shared state for LiveStatus BLE notifications ──────────
+    if (best_id == 1) best_id = 2;
+
     cur_mode_id    = (uint8_t)best_id;
     cur_confidence = confidence;
 
-    // ── 5. Issue #10: distance accumulation ──────────────────────────────
-    // Mark trip start on the first inference after a reset (trip_distance_m==0)
-    if (trip_distance_m == 0.0f) {
+#if DEBUG_RAW
+    Serial.print("#RAW  AX:"); Serial.print(ring[WIN_N-1][0], 3);
+    Serial.print(" AY:");      Serial.print(ring[WIN_N-1][1], 3);
+    Serial.print(" AZ:");      Serial.print(ring[WIN_N-1][2], 3);
+    Serial.print(" GX:");      Serial.print(ring[WIN_N-1][3], 3);
+    Serial.print(" GY:");      Serial.print(ring[WIN_N-1][4], 3);
+    Serial.print(" GZ:");      Serial.println(ring[WIN_N-1][5], 3);
+    Serial.print("#SOFTMAX  ");
+    for (int i = 0; i < N_MODES; i++) {
+        Serial.print(MODE_NAMES[i]); Serial.print(":");
+        Serial.print((int)(all_probs[i] * 100.0f + 0.5f)); Serial.print("%  ");
+    }
+    Serial.println();
+    Serial.print("MODE:"); Serial.print(MODE_NAMES[best_id]);
+    Serial.print("  CONF:"); Serial.print(confidence);
+    Serial.print(lat_frac); Serial.println("ms");
+    return;  
+#endif
+
+    // Trip accumulation
+    if (!trip_active) {
         trip_ts_start = millis() / 1000;
-        trip_mode_id  = (uint8_t)best_id;   // record mode at trip start
+        trip_mode_id  = (uint8_t)best_id;
+        trip_active   = true;
     }
-    // Track dominant motorised mode (last non-walk seen during trip)
-    if (best_id != 4) {
-        trip_mode_id = (uint8_t)best_id;
-    }
+    if (best_id != 4) trip_mode_id = (uint8_t)best_id;
+
     const float delta_m = SPEED_MPS[best_id] * INTERVAL_S;
     trip_distance_m += delta_m;
+    trip_co2_g      += delta_m * CO2_KG_PER_KM[best_id];
 
-    // ── 6. Issue #11: CO₂ accumulation ───────────────────────────────────
-    // co2_g += (delta_m / 1000) * factor_kg_per_km * 1000  = delta_m * factor
-    trip_co2_g += delta_m * CO2_KG_PER_KM[best_id];
-
-    // ── 7. Trip boundary detection — reset accumulators on trip end ──────
-    // Condition A: motorised → walk (arrived at destination)
-    bool trip_end = (prev_mode_id >= 0 && prev_mode_id != 4 && best_id == 4);
-
-    // Condition B: sustained walk ≥ 60 s at conf ≥ 80% (walking segment boundary)
-    if (best_id == 4 && confidence >= 80) {
-        walk_streak++;
-    } else {
-        walk_streak = 0;
-    }
-    if (walk_streak >= 15) {   // 15 × 4 s = 60 s
-        trip_end = true;
-        walk_streak = 0;
-    }
+    // Trip boundary detection
+    bool trip_end = false;
+    if (best_id == 4 && confidence >= 60) walk_streak++;
+    else walk_streak = 0;
+    if (walk_streak >= 5) { trip_end = true; walk_streak = 0; }
 
     if (trip_end && trip_distance_m > 0.0f) {
         uint32_t ts_end = millis() / 1000;
-        Serial.print("TRIP_END  ID:");   Serial.print(trip_id);
-        Serial.print("  DIST:");         Serial.print(trip_distance_m, 1);
-        Serial.print("m  CO2:");         Serial.print(trip_co2_g, 1);
+        Serial.print("TRIP_END  ID:"); Serial.print(trip_id);
+        Serial.print("  DIST:");       Serial.print(trip_distance_m, 1);
+        Serial.print("m  CO2:");       Serial.print(trip_co2_g, 1);
         Serial.println("g");
-        notifyTripRecord(ts_end);        // Issue #8: BLE TripRecord notify
+        notifyTripRecord(ts_end);
         trip_id++;
-        trip_distance_m = 0.0f;
-        trip_co2_g      = 0.0f;
+        resetTrip();
     }
     prev_mode_id = best_id;
 
-    // ── 7. Serial output — running totals ─────────────────────────────────
-    Serial.print("MODE:");
-    Serial.print(MODE_NAMES[best_id]);
-    Serial.print("  CONF:");
-    Serial.print(confidence);
-    Serial.print("%  LAT:");
-    Serial.print(lat_ms);
-    Serial.print(".");
+    // Serial output — one line per inference
+    Serial.print("MODE:"); Serial.print(MODE_NAMES[best_id]);
+    Serial.print("  CONF:"); Serial.print(confidence);
     if (lat_frac < 10) Serial.print("0");
     Serial.print(lat_frac);
-    Serial.print("ms  DIST:");
-    Serial.print(trip_distance_m, 1);
-    Serial.print("m  CO2:");
-    Serial.print(trip_co2_g, 1);
+    Serial.print("ms  DIST:"); Serial.print(trip_distance_m, 1);
+    Serial.print("m  CO2:");   Serial.print(trip_co2_g, 1);
     Serial.println("g");
 }
 
-// =============================================================================
-// setupTFLite — register ops, allocate interpreter (all static, no heap)
-// =============================================================================
+// resetTrip — clear all trip accumulators after TRIP_END
+static void resetTrip() {
+    trip_distance_m = 0.0f;
+    trip_co2_g      = 0.0f;
+    trip_active     = false;
+    trip_mode_id    = 0;
+    trip_ts_start   = 0;
+}
+
+// setupTFLite — register ops, load model, allocate interpreter (all static)
 static bool setupTFLite() {
-    // Register only the ops this model uses:
-    //   Conv2D → MaxPool2D → Conv2D → MaxPool2D → Flatten(Reshape) → Dense → Softmax
     resolver.AddConv2D();
     resolver.AddMaxPool2D();
     resolver.AddFullyConnected();
     resolver.AddSoftmax();
     resolver.AddReshape();
-    resolver.AddQuantize();     // INT8 input dequantize node
+    resolver.AddQuantize();
 
-    const tflite::Model* model = tflite::GetModel(model_co2_beacon_int8_tflite);
+    const tflite::Model* model = tflite::GetModel(g_model_data);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         Serial.print("#ERROR:SCHEMA_MISMATCH  got=");
-        Serial.print(model->version());
-        Serial.print(" want=");
+        Serial.print(model->version()); Serial.print(" want=");
         Serial.println(TFLITE_SCHEMA_VERSION);
         return false;
     }
 
-    // Interpreter lives in static storage — zero heap
     static tflite::MicroInterpreter static_interp(
         model, resolver, tensor_arena, ARENA_BYTES);
     interpreter = &static_interp;
@@ -423,96 +376,72 @@ static bool setupTFLite() {
     input_tensor  = interpreter->input(0);
     output_tensor = interpreter->output(0);
 
-    // Sanity-check tensor shapes
-    // Input expected: (1, 200, 7, 1) = 1400 INT8 elements
     if (input_tensor->dims->size != 4 ||
         input_tensor->dims->data[1] != WIN_N ||
         input_tensor->dims->data[2] != N_CHANNELS) {
         Serial.print("#WARN:INPUT_SHAPE_UNEXPECTED  dims=");
         Serial.println(input_tensor->dims->size);
     }
-    // Output expected: (1, 5) = 5 INT8 elements
     if (output_tensor->dims->data[output_tensor->dims->size - 1] != N_MODES) {
         Serial.print("#WARN:OUTPUT_SHAPE_UNEXPECTED  n=");
         Serial.println(output_tensor->dims->data[output_tensor->dims->size - 1]);
     }
-
     return true;
 }
 
-// =============================================================================
 // BLE callbacks
-// =============================================================================
 static void ble_connect_callback(uint16_t conn_handle) {
     BLEConnection* conn = Bluefruit.Connection(conn_handle);
     char name[32] = {0};
     conn->getPeerName(name, sizeof(name));
-    Serial.print("#BLE:CONNECTED  peer=");
-    Serial.println(name);
+    Serial.print("#BLE:CONNECTED  peer="); Serial.println(name);
 }
 
 static void ble_disconnect_callback(uint16_t conn_handle, uint8_t reason) {
     (void)conn_handle;
-    Serial.print("#BLE:DISCONNECTED  reason=0x");
-    Serial.println(reason, HEX);
+    Serial.print("#BLE:DISCONNECTED  reason=0x"); Serial.println(reason, HEX);
 }
 
-// =============================================================================
-// setupBLE — configure GATT service and characteristics
-// Must be called before startAdv()
-// =============================================================================
+// setupBLE
 static void setupBLE() {
     Bluefruit.begin();
     Bluefruit.setName("CO2-Beacon");
     Bluefruit.Periph.setConnectCallback(ble_connect_callback);
     Bluefruit.Periph.setDisconnectCallback(ble_disconnect_callback);
 
-    // ── CO₂ Beacon GATT service ───────────────────────────────────────────
-    co2_svc.begin();   // must call begin() on service before its characteristics
+    co2_svc.begin();
 
-    // ── LiveStatus characteristic — Notify, fixed 7 bytes ─────────────────
     live_status_chr.setProperties(CHR_PROPS_NOTIFY);
     live_status_chr.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
     live_status_chr.setFixedLen(7);
     live_status_chr.begin();
 
-    // ── TripRecord characteristic — Read + Notify, fixed 20 bytes ─────────
     trip_record_chr.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
     trip_record_chr.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
     trip_record_chr.setFixedLen(20);
-    // Initialise to all-zero so a read before first TRIP_END is well-defined
     uint8_t zeroes[20] = {0};
     trip_record_chr.begin();
     trip_record_chr.write(zeroes, 20);
 }
 
-// =============================================================================
-// startAdv — configure and begin BLE advertising
-// =============================================================================
+// startAdv
 static void startAdv() {
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addTxPower();
     Bluefruit.Advertising.addService(co2_svc);
     Bluefruit.Advertising.addName();
-
-    // Auto-restart advertising after disconnect
     Bluefruit.Advertising.restartOnDisconnect(true);
-    // Fast mode ~100 ms (160 × 0.625 ms), slow mode ~152 ms; fast for 30 s
     Bluefruit.Advertising.setInterval(160, 244);
     Bluefruit.Advertising.setFastTimeout(30);
-    Bluefruit.Advertising.start(0);   // 0 = advertise indefinitely
+    Bluefruit.Advertising.start(0);
 }
 
-// =============================================================================
-// sendLiveStatus — build and notify 7-byte LiveStatus payload
-// Called at 1 Hz from loop()
-// =============================================================================
+// sendLiveStatus — 7-byte BLE notify at 1 Hz
+// Payload: [mode_id, confidence, ts_s×4, trip_active]
 static void sendLiveStatus() {
     if (!Bluefruit.connected()) return;
 
     uint32_t ts = millis() / 1000;
-    uint8_t  trip_active = (trip_distance_m > 0.0f) ? 1 : 0;
-
     uint8_t payload[7];
     payload[0] = cur_mode_id;
     payload[1] = cur_confidence;
@@ -520,52 +449,38 @@ static void sendLiveStatus() {
     payload[3] = (uint8_t)((ts >>  8) & 0xFF);
     payload[4] = (uint8_t)((ts >> 16) & 0xFF);
     payload[5] = (uint8_t)((ts >> 24) & 0xFF);
-    payload[6] = trip_active;
+    payload[6] = trip_active ? 1 : 0;
 
     live_status_chr.notify(payload, 7);
 }
 
-// =============================================================================
-// notifyTripRecord — build and notify 20-byte TripRecord payload on TRIP_END
-// trip_distance_m / trip_co2_g are still non-zero when this is called;
-// they are zeroed by the caller immediately after.
-// =============================================================================
+// notifyTripRecord — 20-byte BLE notify on trip boundary
 static void notifyTripRecord(uint32_t ts_end) {
-    uint16_t dur_s   = (uint16_t)constrain(
-                           (int32_t)(ts_end - trip_ts_start), 0, 65535);
-    uint16_t dist_u  = (uint16_t)constrain((int)trip_distance_m, 0, 65535);
-    uint16_t co2_u   = (uint16_t)constrain((int)trip_co2_g,      0, 65535);
+    uint16_t dur_s  = (uint16_t)constrain((int32_t)(ts_end - trip_ts_start), 0, 65535);
+    uint16_t dist_u = (uint16_t)constrain((int)trip_distance_m, 0, 65535);
+    uint16_t co2_u  = (uint16_t)constrain((int)trip_co2_g,      0, 65535);
 
     uint8_t rec[20] = {0};
-    // [0-1]  trip_id  uint16 LE
-    rec[0] = (uint8_t)(trip_id & 0xFF);
-    rec[1] = (uint8_t)(trip_id >> 8);
-    // [2]    mode_id  (dominant motorised mode, or walk if all-walk)
-    rec[2] = trip_mode_id;
-    // [3]    confidence at trip end
-    rec[3] = cur_confidence;
-    // [4-7]  ts_start uint32 LE
-    rec[4] = (uint8_t)(trip_ts_start & 0xFF);
-    rec[5] = (uint8_t)(trip_ts_start >>  8);
-    rec[6] = (uint8_t)(trip_ts_start >> 16);
-    rec[7] = (uint8_t)(trip_ts_start >> 24);
-    // [8-11] ts_end   uint32 LE
+    rec[0]  = (uint8_t)(trip_id & 0xFF);
+    rec[1]  = (uint8_t)(trip_id >> 8);
+    rec[2]  = trip_mode_id;
+    rec[3]  = cur_confidence;
+    rec[4]  = (uint8_t)(trip_ts_start & 0xFF);
+    rec[5]  = (uint8_t)(trip_ts_start >>  8);
+    rec[6]  = (uint8_t)(trip_ts_start >> 16);
+    rec[7]  = (uint8_t)(trip_ts_start >> 24);
     rec[8]  = (uint8_t)(ts_end & 0xFF);
     rec[9]  = (uint8_t)(ts_end >>  8);
     rec[10] = (uint8_t)(ts_end >> 16);
     rec[11] = (uint8_t)(ts_end >> 24);
-    // [12-13] duration_s uint16 LE
     rec[12] = (uint8_t)(dur_s & 0xFF);
     rec[13] = (uint8_t)(dur_s >> 8);
-    // [14-15] distance_m uint16 LE
     rec[14] = (uint8_t)(dist_u & 0xFF);
     rec[15] = (uint8_t)(dist_u >> 8);
-    // [16-17] co2_g    uint16 LE
     rec[16] = (uint8_t)(co2_u & 0xFF);
     rec[17] = (uint8_t)(co2_u >> 8);
-    // [18-19] reserved = 0x00 (already zero)
 
-    trip_record_chr.write(rec, 20);    // update readable value
+    trip_record_chr.write(rec, 20);
     if (Bluefruit.connected()) {
         trip_record_chr.notify(rec, 20);
     }
