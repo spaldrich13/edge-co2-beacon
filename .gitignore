@@ -12,3 +12,4 @@ data/processed/windowed/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+docs/CLAUDE.md

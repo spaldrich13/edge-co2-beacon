@@ -121,7 +121,7 @@ Then open `http://localhost:8000`, click Connect, and choose `CO2-Beacon`.
 
 ## Development notes
 
-The build was run from 16 scoped GitHub issues (`docs/BUILD_PHASES.md`), and commits reference them by number. I wrote the requirements, collected and labelled the data, designed the experiments, and made the design calls. Much of the implementation was done with an AI coding assistant working from the structured instructions in `docs/CLAUDE.md`, and I reviewed and hardware-tested each change.
+The build was run from 16 scoped GitHub issues (`docs/BUILD_PHASES.md`), and commits reference them by number. I wrote the requirements, collected and labelled the data, designed the experiments, and made the design calls. Much of the implementation was done with an AI coding assistant working from structured instructions with a locked scope and acceptance criteria for each issue, and I reviewed and hardware-tested each change.
 
 ## Author
 
