@@ -10,6 +10,13 @@ Solo senior capstone, Union College ECE-498/499 (2025–26). Advisor: Prof. Mich
   <img src="docs/images/prototype.jpg" width="620" alt="Breadboard prototype: Feather nRF52840, BNO055 IMU, BMP390 barometer, 1200 mAh battery, trip button">
 </p>
 
+## Firmware highlights
+
+- Static ring buffer, no dynamic allocation
+- Wrap-safe micros() scheduling holds 25 Hz without delay()
+- Packed little-endian BLE payloads (7 B / 20 B), verified byte by byte in nRF Connect
+- 62% flash / 28% RAM, with a 50 KB TFLite Micro arena (~30 KB peak)
+
 ## Results
 
 | Specification | Target | Result | Status |
